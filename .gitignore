@@ -1,0 +1,5 @@
+infra/*.json
+infra/*.local.bicepparam
+TestResults/
+*.log
+.DS_Store

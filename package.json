@@ -1,0 +1,13 @@
+{
+  "name": "azure-keyvault-change-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monitor existing Azure Key Vault secret and certificate metadata for updates.",
+  "scripts": {
+    "build:bicep": "pwsh -NoProfile -File ./scripts/Invoke-BicepBuild.ps1",
+    "lint:ps": "pwsh -NoProfile -File ./scripts/Invoke-Lint.ps1",
+    "test": "npm run test:ps",
+    "test:ps": "pwsh -NoProfile -File ./scripts/Invoke-Tests.ps1",
+    "validate": "npm run build:bicep && npm run lint:ps && npm run test:ps"
+  }
+}
