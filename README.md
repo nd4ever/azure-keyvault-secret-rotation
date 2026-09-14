@@ -31,6 +31,14 @@ flowchart LR
     RUNBOOK -->|Changes or failures| EMAIL
 ```
 
+## Disclaimer
+
+This project is a personal, community sample provided as-is and as-available,
+without warranty of any kind, express or implied. It is not an official
+Microsoft product or a supported offering. No license is currently granted, so
+all rights are reserved. Review, test, and validate the code in a
+nonproduction environment before relying on it. Use at your own risk.
+
 ## Behavior
 
 The monitor performs these steps on each run:
