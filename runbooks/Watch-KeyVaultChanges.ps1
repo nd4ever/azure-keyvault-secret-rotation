@@ -513,17 +513,28 @@ function Compare-MonitorItem {
     $Changes = [System.Collections.Generic.List[object]]::new()
 
     foreach ($Key in $CurrentItems.Keys) {
+        $CurrentItem = $CurrentItems[$Key]
+
         if (-not $PreviousItems.Contains($Key)) {
+            $Changes.Add([pscustomobject]@{
+                ChangeType             = 'New'
+                CurrentUpdatedAtEpoch  = Get-MonitorProperty -InputObject $CurrentItem -Name 'updatedAtEpoch'
+                Name                   = Get-MonitorProperty -InputObject $CurrentItem -Name 'name'
+                ObjectType             = Get-MonitorProperty -InputObject $CurrentItem -Name 'objectType'
+                PreviousUpdatedAtEpoch = $null
+                SubscriptionId         = Get-MonitorProperty -InputObject $CurrentItem -Name 'subscriptionId'
+                VaultName              = Get-MonitorProperty -InputObject $CurrentItem -Name 'vaultName'
+            })
             continue
         }
 
         $PreviousItem = $PreviousItems[$Key]
-        $CurrentItem = $CurrentItems[$Key]
         $PreviousFingerprint = Get-MonitorProperty -InputObject $PreviousItem -Name 'fingerprint'
         $CurrentFingerprint = Get-MonitorProperty -InputObject $CurrentItem -Name 'fingerprint'
 
         if ($PreviousFingerprint -ne $CurrentFingerprint) {
             $Changes.Add([pscustomobject]@{
+                ChangeType             = 'Modified'
                 CurrentUpdatedAtEpoch  = Get-MonitorProperty -InputObject $CurrentItem -Name 'updatedAtEpoch'
                 Name                   = Get-MonitorProperty -InputObject $CurrentItem -Name 'name'
                 ObjectType             = Get-MonitorProperty -InputObject $CurrentItem -Name 'objectType'
@@ -532,6 +543,23 @@ function Compare-MonitorItem {
                 VaultName              = Get-MonitorProperty -InputObject $CurrentItem -Name 'vaultName'
             })
         }
+    }
+
+    foreach ($Key in $PreviousItems.Keys) {
+        if ($CurrentItems.Contains($Key)) {
+            continue
+        }
+
+        $PreviousItem = $PreviousItems[$Key]
+        $Changes.Add([pscustomobject]@{
+            ChangeType             = 'Deleted'
+            CurrentUpdatedAtEpoch  = $null
+            Name                   = Get-MonitorProperty -InputObject $PreviousItem -Name 'name'
+            ObjectType             = Get-MonitorProperty -InputObject $PreviousItem -Name 'objectType'
+            PreviousUpdatedAtEpoch = Get-MonitorProperty -InputObject $PreviousItem -Name 'updatedAtEpoch'
+            SubscriptionId         = Get-MonitorProperty -InputObject $PreviousItem -Name 'subscriptionId'
+            VaultName              = Get-MonitorProperty -InputObject $PreviousItem -Name 'vaultName'
+        })
     }
 
     return $Changes.ToArray()
@@ -595,7 +623,7 @@ function ConvertTo-MonitorEmailContent {
             $PreviousTime = Get-MonitorUtcTimestamp -EpochSeconds $Change.PreviousUpdatedAtEpoch
             $CurrentTime = Get-MonitorUtcTimestamp -EpochSeconds $Change.CurrentUpdatedAtEpoch
             [void]$PlainText.AppendLine(
-                "- $($Change.ObjectType) $($Change.VaultName)/$($Change.Name): $PreviousTime -> $CurrentTime"
+                "- [$($Change.ChangeType)] $($Change.ObjectType) $($Change.VaultName)/$($Change.Name): $PreviousTime -> $CurrentTime"
             )
         }
     }
@@ -621,9 +649,10 @@ function ConvertTo-MonitorEmailContent {
 
     if ($Changes.Count -gt 0) {
         [void]$Html.Append('<h3>Changes</h3><table style="border-collapse:collapse">')
-        [void]$Html.Append('<tr><th>Subscription</th><th>Vault</th><th>Type</th><th>Name</th><th>Previous update</th><th>Current update</th></tr>')
+        [void]$Html.Append('<tr><th>Change</th><th>Subscription</th><th>Vault</th><th>Type</th><th>Name</th><th>Previous update</th><th>Current update</th></tr>')
         foreach ($Change in $Changes) {
             $Cells = @(
+                $Change.ChangeType
                 $Change.SubscriptionId
                 $Change.VaultName
                 $Change.ObjectType

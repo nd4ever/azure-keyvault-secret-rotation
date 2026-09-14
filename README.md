@@ -39,14 +39,16 @@ The monitor performs these steps on each run:
 2. Lists current secret and certificate metadata through the Key Vault REST API.
 3. Compares update time, enabled state, validity dates, and certificate
    thumbprint with the previous snapshot.
-4. Emails the configured recipient when an existing item changes or any scan
-   scope fails.
+4. Emails the configured recipient when an item is new, modified, or deleted, or
+   when any scan scope fails.
 5. Writes the new metadata snapshot with Blob Storage ETag protection.
 
-The first successful run establishes the baseline and does not report items as
-changes. Newly discovered or removed items are not update events. If a
-subscription, vault, or object type cannot be scanned, the prior state for that
-scope is retained so a transient failure cannot erase its baseline.
+Each reported change carries a type: `New` for an item that appeared since the
+last run, `Modified` for an existing item whose metadata changed, and `Deleted`
+for an item that no longer exists. The first successful run establishes the
+baseline and does not report items as changes. If a subscription, vault, or
+object type cannot be scanned, the prior state for that scope is retained so a
+transient failure is not misreported as a deletion.
 
 ## Deployed resources
 

@@ -67,11 +67,12 @@ Describe 'Compare-MonitorItem' -Tag 'Unit' {
         $Changes = @(Compare-MonitorItem -PreviousItems $PreviousItems -CurrentItems $CurrentItems)
 
         $Changes | Should -HaveCount 1
+        $Changes[0].ChangeType | Should -BeExactly 'Modified'
         $Changes[0].PreviousUpdatedAtEpoch | Should -Be 100
         $Changes[0].CurrentUpdatedAtEpoch | Should -Be 200
     }
 
-    It 'Does not report an item that is new to the current baseline' {
+    It 'Reports an item that is new to the current baseline' {
         $CurrentItems = @{
             'https://vault-one.vault.azure.net/secrets/new-secret' = Get-TestMonitorItem `
                 -Identifier 'https://vault-one.vault.azure.net/secrets/new-secret'
@@ -79,7 +80,22 @@ Describe 'Compare-MonitorItem' -Tag 'Unit' {
 
         $Changes = @(Compare-MonitorItem -PreviousItems @{} -CurrentItems $CurrentItems)
 
-        $Changes | Should -HaveCount 0
+        $Changes | Should -HaveCount 1
+        $Changes[0].ChangeType | Should -BeExactly 'New'
+        $Changes[0].PreviousUpdatedAtEpoch | Should -BeNullOrEmpty
+        $Changes[0].CurrentUpdatedAtEpoch | Should -Be 100
+    }
+
+    It 'Reports an item that was deleted from the current baseline' {
+        $Key = 'https://vault-one.vault.azure.net/secrets/example'
+        $PreviousItems = @{ $Key = Get-TestMonitorItem }
+
+        $Changes = @(Compare-MonitorItem -PreviousItems $PreviousItems -CurrentItems @{})
+
+        $Changes | Should -HaveCount 1
+        $Changes[0].ChangeType | Should -BeExactly 'Deleted'
+        $Changes[0].PreviousUpdatedAtEpoch | Should -Be 100
+        $Changes[0].CurrentUpdatedAtEpoch | Should -BeNullOrEmpty
     }
 
     It 'Does not report an unchanged existing item' {
@@ -162,6 +178,7 @@ Describe 'ConvertTo-MonitorEmailContent' -Tag 'Unit' {
     It 'HTML encodes item and failure details' {
         $Changes = @(
             [pscustomobject]@{
+                ChangeType             = 'Modified'
                 CurrentUpdatedAtEpoch  = 200
                 Name                   = '<script>alert(1)</script>'
                 ObjectType             = 'Secret'
