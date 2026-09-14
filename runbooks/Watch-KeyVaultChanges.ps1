@@ -7,7 +7,8 @@
     Uses the Automation account managed identity and Azure REST APIs to scan
     secret and certificate metadata, compare it with a blob-based baseline,
     and send change or scan-failure notifications through Azure Communication
-    Services Email. Secret values are never requested.
+    Services Email. It also warns when a secret or certificate nears or passes
+    its expiration date. Secret values are never requested.
 .PARAMETER CommunicationEndpoint
     Endpoint of the Azure Communication Services resource.
 .PARAMETER MonitoredSubscriptionIdsJson
@@ -22,6 +23,10 @@
     Name of the blob container containing monitor state.
 .PARAMETER StateStorageAccountName
     Name of the storage account containing monitor state.
+.PARAMETER ExpiryWarningThresholdDays
+    Days before expiration when reminders begin. Defaults to 30.
+.PARAMETER ExpiryReminderIntervalDays
+    Minimum days between repeated expiration reminders. Defaults to 7.
 #>
 
 [CmdletBinding()]
@@ -52,7 +57,13 @@ param(
 
     [Parameter(Mandatory = $false)]
     [AllowEmptyString()]
-    [string]$StateStorageAccountName
+    [string]$StateStorageAccountName,
+
+    [Parameter(Mandatory = $false)]
+    [int]$ExpiryWarningThresholdDays = 30,
+
+    [Parameter(Mandatory = $false)]
+    [int]$ExpiryReminderIntervalDays = 7
 )
 
 $ErrorActionPreference = 'Stop'
@@ -565,6 +576,93 @@ function Compare-MonitorItem {
     return $Changes.ToArray()
 }
 
+function Get-MonitorExpiryAlert {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$PreviousItems,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$CurrentItems,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.HashSet[string]]$EvaluatedKeys,
+
+        [Parameter(Mandatory = $true)]
+        [int]$WarningThresholdDays,
+
+        [Parameter(Mandatory = $true)]
+        [int]$ReminderIntervalDays,
+
+        [Parameter(Mandatory = $true)]
+        [long]$NowEpoch
+    )
+
+    $Alerts = [System.Collections.Generic.List[object]]::new()
+    $WarningWindowSeconds = [long]$WarningThresholdDays * 86400
+    $ReminderIntervalSeconds = [long]$ReminderIntervalDays * 86400
+
+    foreach ($Key in $EvaluatedKeys) {
+        if (-not $CurrentItems.Contains($Key)) {
+            continue
+        }
+
+        $CurrentItem = $CurrentItems[$Key]
+        $ExpiresAtValue = Get-MonitorProperty -InputObject $CurrentItem -Name 'expiresAtEpoch'
+        if ($null -eq $ExpiresAtValue -or [string]::IsNullOrWhiteSpace([string]$ExpiresAtValue)) {
+            continue
+        }
+
+        $ExpiresAtEpoch = [long]$ExpiresAtValue
+        if (($ExpiresAtEpoch - $NowEpoch) -gt $WarningWindowSeconds) {
+            continue
+        }
+
+        $PreviousItem = if ($PreviousItems.Contains($Key)) { $PreviousItems[$Key] } else { $null }
+        $LastNotified = Get-MonitorProperty -InputObject $PreviousItem -Name 'expiryNotifiedEpoch'
+        $IsDue = $true
+        if ($null -ne $LastNotified -and -not [string]::IsNullOrWhiteSpace([string]$LastNotified)) {
+            $IsDue = ($NowEpoch - [long]$LastNotified) -ge $ReminderIntervalSeconds
+        }
+
+        if ($IsDue) {
+            $CurrentItem['expiryNotifiedEpoch'] = $NowEpoch
+            $Alerts.Add([pscustomobject]@{
+                DaysUntilExpiry = [int][Math]::Floor(($ExpiresAtEpoch - $NowEpoch) / 86400)
+                ExpiresAtEpoch  = $ExpiresAtEpoch
+                Name            = Get-MonitorProperty -InputObject $CurrentItem -Name 'name'
+                ObjectType      = Get-MonitorProperty -InputObject $CurrentItem -Name 'objectType'
+                SubscriptionId  = Get-MonitorProperty -InputObject $CurrentItem -Name 'subscriptionId'
+                VaultName       = Get-MonitorProperty -InputObject $CurrentItem -Name 'vaultName'
+            })
+        }
+        else {
+            # Preserve the prior reminder timestamp so the weekly cadence keeps counting.
+            $CurrentItem['expiryNotifiedEpoch'] = [long]$LastNotified
+        }
+    }
+
+    return $Alerts.ToArray()
+}
+
+function Get-MonitorExpiryStatusText {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$DaysUntilExpiry
+    )
+
+    if ($DaysUntilExpiry -lt 0) {
+        return "expired $([Math]::Abs($DaysUntilExpiry)) day(s) ago"
+    }
+    if ($DaysUntilExpiry -eq 0) {
+        return 'expires today'
+    }
+
+    return "expires in $DaysUntilExpiry day(s)"
+}
+
 function Get-MonitorUtcTimestamp {
     [CmdletBinding()]
     param(
@@ -589,6 +687,10 @@ function ConvertTo-MonitorEmailContent {
 
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
+        [object[]]$Expirations,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$Failures,
 
         [Parameter(Mandatory = $true)]
@@ -602,6 +704,9 @@ function ConvertTo-MonitorEmailContent {
     if ($Changes.Count -gt 0) {
         $SubjectParts.Add("$($Changes.Count) change(s)")
     }
+    if ($Expirations.Count -gt 0) {
+        $SubjectParts.Add("$($Expirations.Count) expiring")
+    }
     if ($Failures.Count -gt 0) {
         $SubjectParts.Add("$($Failures.Count) scan failure(s)")
     }
@@ -611,6 +716,7 @@ function ConvertTo-MonitorEmailContent {
     [void]$PlainText.AppendLine('Azure Key Vault change monitor')
     [void]$PlainText.AppendLine("Vaults discovered: $VaultCount")
     [void]$PlainText.AppendLine("Changes detected: $($Changes.Count)")
+    [void]$PlainText.AppendLine("Expiring items: $($Expirations.Count)")
     [void]$PlainText.AppendLine("Scan failures: $($Failures.Count)")
     if ($IsFirstRun) {
         [void]$PlainText.AppendLine('This run established the initial baseline; new items were not reported as changes.')
@@ -624,6 +730,18 @@ function ConvertTo-MonitorEmailContent {
             $CurrentTime = Get-MonitorUtcTimestamp -EpochSeconds $Change.CurrentUpdatedAtEpoch
             [void]$PlainText.AppendLine(
                 "- [$($Change.ChangeType)] $($Change.ObjectType) $($Change.VaultName)/$($Change.Name): $PreviousTime -> $CurrentTime"
+            )
+        }
+    }
+
+    if ($Expirations.Count -gt 0) {
+        [void]$PlainText.AppendLine()
+        [void]$PlainText.AppendLine('Upcoming expirations')
+        foreach ($Expiration in $Expirations) {
+            $ExpiresTime = Get-MonitorUtcTimestamp -EpochSeconds $Expiration.ExpiresAtEpoch
+            $StatusText = Get-MonitorExpiryStatusText -DaysUntilExpiry $Expiration.DaysUntilExpiry
+            [void]$PlainText.AppendLine(
+                "- $($Expiration.ObjectType) $($Expiration.VaultName)/$($Expiration.Name): $StatusText (expires $ExpiresTime)"
             )
         }
     }
@@ -642,6 +760,7 @@ function ConvertTo-MonitorEmailContent {
     [void]$Html.Append('<h2>Azure Key Vault change monitor</h2>')
     [void]$Html.Append("<p>Vaults discovered: $VaultCount<br>")
     [void]$Html.Append("Changes detected: $($Changes.Count)<br>")
+    [void]$Html.Append("Expiring items: $($Expirations.Count)<br>")
     [void]$Html.Append("Scan failures: $($Failures.Count)</p>")
     if ($IsFirstRun) {
         [void]$Html.Append('<p>This run established the initial baseline; new items were not reported as changes.</p>')
@@ -659,6 +778,29 @@ function ConvertTo-MonitorEmailContent {
                 $Change.Name
                 (Get-MonitorUtcTimestamp -EpochSeconds $Change.PreviousUpdatedAtEpoch)
                 (Get-MonitorUtcTimestamp -EpochSeconds $Change.CurrentUpdatedAtEpoch)
+            )
+            [void]$Html.Append('<tr>')
+            foreach ($Cell in $Cells) {
+                [void]$Html.Append('<td style="border:1px solid #d1d1d1;padding:6px">')
+                [void]$Html.Append($Encode.Invoke([string]$Cell))
+                [void]$Html.Append('</td>')
+            }
+            [void]$Html.Append('</tr>')
+        }
+        [void]$Html.Append('</table>')
+    }
+
+    if ($Expirations.Count -gt 0) {
+        [void]$Html.Append('<h3>Upcoming expirations</h3><table style="border-collapse:collapse">')
+        [void]$Html.Append('<tr><th>Subscription</th><th>Vault</th><th>Type</th><th>Name</th><th>Status</th><th>Expires</th></tr>')
+        foreach ($Expiration in $Expirations) {
+            $Cells = @(
+                $Expiration.SubscriptionId
+                $Expiration.VaultName
+                $Expiration.ObjectType
+                $Expiration.Name
+                (Get-MonitorExpiryStatusText -DaysUntilExpiry $Expiration.DaysUntilExpiry)
+                (Get-MonitorUtcTimestamp -EpochSeconds $Expiration.ExpiresAtEpoch)
             )
             [void]$Html.Append('<tr>')
             foreach ($Cell in $Cells) {
@@ -757,7 +899,13 @@ function Invoke-KeyVaultChangeMonitor {
         [string]$StateContainerName,
 
         [Parameter(Mandatory = $true)]
-        [string]$StateStorageAccountName
+        [string]$StateStorageAccountName,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ExpiryWarningThresholdDays = 30,
+
+        [Parameter(Mandatory = $false)]
+        [int]$ExpiryReminderIntervalDays = 7
     )
 
     $SubscriptionIds = @($MonitoredSubscriptionIdsJson | ConvertFrom-Json)
@@ -777,6 +925,7 @@ function Invoke-KeyVaultChangeMonitor {
     $StateResult = Read-MonitorState -BlobUri $BlobUri -AccessToken $StorageToken
     $PreviousItems = Get-MonitorProperty -InputObject $StateResult.State -Name 'items'
     $CurrentItems = @{}
+    $FreshItemKeys = [System.Collections.Generic.HashSet[string]]::new()
     $Failures = [System.Collections.Generic.List[object]]::new()
     $VaultCount = 0
 
@@ -822,6 +971,7 @@ function Invoke-KeyVaultChangeMonitor {
                             -ObjectType $ObjectType
                         $Key = ([string]$MonitorItem.identifier).ToLowerInvariant()
                         $CurrentItems[$Key] = $MonitorItem
+                        [void]$FreshItemKeys.Add($Key)
                     }
                 }
                 catch {
@@ -839,6 +989,18 @@ function Invoke-KeyVaultChangeMonitor {
         }
     }
 
+    $NowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    # Evaluate expiry only for freshly scanned items so a scan failure is not treated as a renewal.
+    $Expirations = @(
+        Get-MonitorExpiryAlert `
+            -PreviousItems $PreviousItems `
+            -CurrentItems $CurrentItems `
+            -EvaluatedKeys $FreshItemKeys `
+            -WarningThresholdDays $ExpiryWarningThresholdDays `
+            -ReminderIntervalDays $ExpiryReminderIntervalDays `
+            -NowEpoch $NowEpoch
+    )
+
     $CurrentState = [ordered]@{
         schemaVersion  = 1
         generatedAtUtc = $null
@@ -852,9 +1014,10 @@ function Invoke-KeyVaultChangeMonitor {
     )
 
     $EmailOperationId = $null
-    if ($Changes.Count -gt 0) {
+    if ($Changes.Count -gt 0 -or $Expirations.Count -gt 0) {
         $EmailContent = ConvertTo-MonitorEmailContent `
             -Changes $Changes `
+            -Expirations $Expirations `
             -Failures $Failures.ToArray() `
             -VaultCount $VaultCount `
             -IsFirstRun (-not $StateResult.Exists)
@@ -875,6 +1038,7 @@ function Invoke-KeyVaultChangeMonitor {
     return [pscustomobject]@{
         Changes          = $Changes.Count
         EmailOperationId = $EmailOperationId
+        Expirations      = $Expirations.Count
         Failures         = $Failures.Count
         Items            = $CurrentItems.Count
         Vaults           = $VaultCount
@@ -910,5 +1074,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         -SenderAddress (Get-MonitorConfigurationValue -Name 'SenderAddress' -Value $SenderAddress) `
         -StateBlobName (Get-MonitorConfigurationValue -Name 'StateBlobName' -Value $StateBlobName) `
         -StateContainerName (Get-MonitorConfigurationValue -Name 'StateContainerName' -Value $StateContainerName) `
-        -StateStorageAccountName (Get-MonitorConfigurationValue -Name 'StateStorageAccountName' -Value $StateStorageAccountName)
+        -StateStorageAccountName (Get-MonitorConfigurationValue -Name 'StateStorageAccountName' -Value $StateStorageAccountName) `
+        -ExpiryWarningThresholdDays $ExpiryWarningThresholdDays `
+        -ExpiryReminderIntervalDays $ExpiryReminderIntervalDays
 }

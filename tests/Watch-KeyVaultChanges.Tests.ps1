@@ -32,6 +32,29 @@ BeforeAll {
             vaultResourceId = $VaultResourceId
         }
     }
+
+    $script:ExpiryNowEpoch = [DateTimeOffset]::new(
+        [DateTime]::new(2026, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).ToUnixTimeSeconds()
+
+    function Get-ExpiryTestItem {
+        param(
+            [long]$ExpiresInDays,
+            [object]$NotifiedDaysAgo = $null
+        )
+
+        $Item = [ordered]@{
+            expiresAtEpoch = $script:ExpiryNowEpoch + ($ExpiresInDays * 86400)
+            name           = 'expiring'
+            objectType     = 'Secret'
+            subscriptionId = 'subscription-one'
+            vaultName      = 'vault-one'
+        }
+        if ($null -ne $NotifiedDaysAgo) {
+            $Item['expiryNotifiedEpoch'] = $script:ExpiryNowEpoch - ([long]$NotifiedDaysAgo * 86400)
+        }
+
+        return $Item
+    }
 }
 
 Describe 'ConvertTo-MonitorItem' -Tag 'Unit' {
@@ -196,6 +219,7 @@ Describe 'ConvertTo-MonitorEmailContent' -Tag 'Unit' {
 
         $Content = ConvertTo-MonitorEmailContent `
             -Changes $Changes `
+            -Expirations @() `
             -Failures $Failures `
             -VaultCount 1 `
             -IsFirstRun $false
@@ -216,11 +240,130 @@ Describe 'ConvertTo-MonitorEmailContent' -Tag 'Unit' {
 
         $Content = ConvertTo-MonitorEmailContent `
             -Changes @() `
+            -Expirations @() `
             -Failures $Failures `
             -VaultCount 0 `
             -IsFirstRun $true
 
         $Content.Subject | Should -BeExactly 'Key Vault monitor: 1 scan failure(s)'
         $Content.Html | Should -Match 'Changes detected: 0'
+    }
+
+    It 'Renders an expirations section and subject' {
+        $Expirations = @(
+            [pscustomobject]@{
+                DaysUntilExpiry = 10
+                ExpiresAtEpoch  = 1893456000
+                Name            = 'expiring-secret'
+                ObjectType      = 'Secret'
+                SubscriptionId  = 'subscription-one'
+                VaultName       = 'vault-one'
+            }
+        )
+
+        $Content = ConvertTo-MonitorEmailContent `
+            -Changes @() `
+            -Expirations $Expirations `
+            -Failures @() `
+            -VaultCount 1 `
+            -IsFirstRun $false
+
+        $Content.Subject | Should -BeExactly 'Key Vault monitor: 1 expiring'
+        $Content.Html | Should -Match 'Upcoming expirations'
+        $Content.PlainText | Should -Match 'expires in 10 day\(s\)'
+    }
+}
+
+Describe 'Get-MonitorExpiryAlert' -Tag 'Unit' {
+    It 'Alerts on first notification within the warning window' {
+        $Key = 'https://vault-one.vault.azure.net/secrets/expiring'
+        $Current = @{ $Key = Get-ExpiryTestItem -ExpiresInDays 10 }
+        $Keys = [System.Collections.Generic.HashSet[string]]::new()
+        [void]$Keys.Add($Key)
+
+        $Alerts = @(Get-MonitorExpiryAlert `
+            -PreviousItems @{} `
+            -CurrentItems $Current `
+            -EvaluatedKeys $Keys `
+            -WarningThresholdDays 30 `
+            -ReminderIntervalDays 7 `
+            -NowEpoch $script:ExpiryNowEpoch)
+
+        $Alerts | Should -HaveCount 1
+        $Alerts[0].DaysUntilExpiry | Should -Be 10
+        $Current[$Key]['expiryNotifiedEpoch'] | Should -Be $script:ExpiryNowEpoch
+    }
+
+    It 'Does not alert outside the warning window' {
+        $Key = 'https://vault-one.vault.azure.net/secrets/future'
+        $Current = @{ $Key = Get-ExpiryTestItem -ExpiresInDays 45 }
+        $Keys = [System.Collections.Generic.HashSet[string]]::new()
+        [void]$Keys.Add($Key)
+
+        $Alerts = @(Get-MonitorExpiryAlert `
+            -PreviousItems @{} `
+            -CurrentItems $Current `
+            -EvaluatedKeys $Keys `
+            -WarningThresholdDays 30 `
+            -ReminderIntervalDays 7 `
+            -NowEpoch $script:ExpiryNowEpoch)
+
+        $Alerts | Should -HaveCount 0
+    }
+
+    It 'Suppresses a reminder within the interval' {
+        $Key = 'https://vault-one.vault.azure.net/secrets/expiring'
+        $Previous = @{ $Key = Get-ExpiryTestItem -ExpiresInDays 10 -NotifiedDaysAgo 3 }
+        $Current = @{ $Key = Get-ExpiryTestItem -ExpiresInDays 10 }
+        $Keys = [System.Collections.Generic.HashSet[string]]::new()
+        [void]$Keys.Add($Key)
+
+        $Alerts = @(Get-MonitorExpiryAlert `
+            -PreviousItems $Previous `
+            -CurrentItems $Current `
+            -EvaluatedKeys $Keys `
+            -WarningThresholdDays 30 `
+            -ReminderIntervalDays 7 `
+            -NowEpoch $script:ExpiryNowEpoch)
+
+        $Alerts | Should -HaveCount 0
+        $Current[$Key]['expiryNotifiedEpoch'] | Should -Be $Previous[$Key]['expiryNotifiedEpoch']
+    }
+
+    It 'Sends a reminder after the interval elapses' {
+        $Key = 'https://vault-one.vault.azure.net/secrets/expiring'
+        $Previous = @{ $Key = Get-ExpiryTestItem -ExpiresInDays 5 -NotifiedDaysAgo 8 }
+        $Current = @{ $Key = Get-ExpiryTestItem -ExpiresInDays 5 }
+        $Keys = [System.Collections.Generic.HashSet[string]]::new()
+        [void]$Keys.Add($Key)
+
+        $Alerts = @(Get-MonitorExpiryAlert `
+            -PreviousItems $Previous `
+            -CurrentItems $Current `
+            -EvaluatedKeys $Keys `
+            -WarningThresholdDays 30 `
+            -ReminderIntervalDays 7 `
+            -NowEpoch $script:ExpiryNowEpoch)
+
+        $Alerts | Should -HaveCount 1
+        $Current[$Key]['expiryNotifiedEpoch'] | Should -Be $script:ExpiryNowEpoch
+    }
+
+    It 'Alerts on an already expired item' {
+        $Key = 'https://vault-one.vault.azure.net/secrets/expired'
+        $Current = @{ $Key = Get-ExpiryTestItem -ExpiresInDays -3 }
+        $Keys = [System.Collections.Generic.HashSet[string]]::new()
+        [void]$Keys.Add($Key)
+
+        $Alerts = @(Get-MonitorExpiryAlert `
+            -PreviousItems @{} `
+            -CurrentItems $Current `
+            -EvaluatedKeys $Keys `
+            -WarningThresholdDays 30 `
+            -ReminderIntervalDays 7 `
+            -NowEpoch $script:ExpiryNowEpoch)
+
+        $Alerts | Should -HaveCount 1
+        $Alerts[0].DaysUntilExpiry | Should -Be -3
     }
 }

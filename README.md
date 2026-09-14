@@ -39,8 +39,8 @@ The monitor performs these steps on each run:
 2. Lists current secret and certificate metadata through the Key Vault REST API.
 3. Compares update time, enabled state, validity dates, and certificate
    thumbprint with the previous snapshot.
-4. Emails the configured recipient when an item is new, modified, or deleted, or
-   when any scan scope fails.
+4. Emails the configured recipient when an item is new, modified, or deleted,
+   when an item nears or passes its expiration, or when any scan scope fails.
 5. Writes the new metadata snapshot with Blob Storage ETag protection.
 
 Each reported change carries a type: `New` for an item that appeared since the
@@ -49,6 +49,12 @@ for an item that no longer exists. The first successful run establishes the
 baseline and does not report items as changes. If a subscription, vault, or
 object type cannot be scanned, the prior state for that scope is retained so a
 transient failure is not misreported as a deletion.
+
+Secrets and certificates with an expiration date trigger a reminder once they
+fall within 30 days of expiring, and again no more than weekly until they are
+renewed or removed. Items without an expiration date are never flagged. The
+30-day threshold and weekly interval are the `ExpiryWarningThresholdDays` and
+`ExpiryReminderIntervalDays` runbook parameters.
 
 ## Deployed resources
 
@@ -88,10 +94,32 @@ identity. When you reuse Communication Services, it must already be linked to
 an Email Communication Services domain, and you must provide a verified sender
 address.
 
-> [!IMPORTANT]
-> The cloud-hosted runbook must have network access to each Key Vault data-plane
-> endpoint. Vault firewall or private endpoint configurations can block the
-> scan. Those failures are included in the notification and retained state.
+## Networking
+
+The runbook runs on shared Azure Automation cloud infrastructure with dynamic
+outbound IP addresses, so it cannot be allowed through a firewall by IP address
+or service tag. Plan network access for its two dependencies accordingly.
+
+### State storage account
+
+The deployment keeps the state storage account reachable but locked to the
+Automation account: `publicNetworkAccess` stays `Enabled`, the firewall default
+action is `Deny`, and a resource instance rule grants only this solution's
+Automation account. No other caller reaches the account, so this is not open
+public access. If a Secure Future Initiative or similar policy forces
+`publicNetworkAccess` to `Disabled`, supply an exemption through the
+`-StateStoragePolicyExemptionTags` deployment parameter so the account keeps its
+resource-scoped public endpoint.
+
+### Monitored Key Vaults
+
+The runbook reads each vault's data plane directly. Key Vault has no
+resource-instance rule, and the Automation sandbox is not a trusted service, so
+each vault must permit the scan through its own firewall. A vault whose public
+access is disabled, or whose firewall excludes the sandbox, returns an HTTP 403
+that the run records as a scan failure and never mistakes for a deletion. A
+fully private vault requires a Hybrid Runbook Worker with private-endpoint
+access, which this solution does not deploy.
 
 ## Deploy interactively
 
